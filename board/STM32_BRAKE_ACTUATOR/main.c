@@ -1,3 +1,14 @@
+/*
+PIN CONFIG:
+Pin 15 - PA1 - MOTOR2
+Pin 16 - PA2 - MOTOR1
+Pin 23 - PA7 - CLUTCH
+Pedal IN1 - PC0 - BRAKE_PRESSED
+Pin 42 -PA9 - ANGLE_SENSOR_PWM
+*/
+
+// TODO: implement a PCM_CANCEL
+
 // ********************* Includes *********************
 #include "../config.h"
 #include "libc.h"
@@ -15,7 +26,7 @@
 #include "board.h"
 
 #include "drivers/clock.h"
-#include "drivers/dac.h"
+//#include "drivers/dac.h"
 #include "drivers/timer.h"
 
 #include "gpio.h"
@@ -23,7 +34,8 @@
 
 #define CAN CAN1
 
-//#define PEDAL_USB
+#define PEDAL_USB
+#define DEBUG
 
 #ifdef PEDAL_USB
   #include "drivers/uart.h"
@@ -50,7 +62,6 @@ void __initialize_hardware_early(void) {
 }
 
 // ********************* serial debugging *********************
-
 #ifdef PEDAL_USB
 
 void debug_ring_callback(uart_ring *ring) {
@@ -76,6 +87,7 @@ void usb_cb_ep3_out(void *usbdata, int len, bool hardwired) {
   UNUSED(len);
   UNUSED(hardwired);
 }
+void usb_cb_ep3_out_complete(void) {}
 void usb_cb_enumeration_complete(void) {}
 
 int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) {
@@ -109,8 +121,8 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
 // ***************************** can port *****************************
 
 // addresses to be used on CAN
-#define CAN_GAS_INPUT  0x200
-#define CAN_GAS_OUTPUT 0x201U
+#define CAN_GAS_INPUT  0x450
+#define CAN_GAS_OUTPUT 0x451U
 #define CAN_GAS_SIZE 6
 #define COUNTER_CYCLE 0xFU
 
@@ -122,6 +134,9 @@ void CAN1_TX_IRQ_Handler(void) {
 // two independent values
 uint16_t gas_set_0 = 0;
 uint16_t gas_set_1 = 0;
+// vars for angle sensor
+uint16_t pwm = 0;
+uint16_t ts_prev = 0;
 
 #define MAX_TIMEOUT 10U
 uint32_t timeout = 0;
@@ -218,7 +233,7 @@ void TIM3_IRQ_Handler(void) {
     puts(" ");
     puth(pdl0);
     puts(" ");
-    puth(pdl1);
+    puth(pwm);
     puts("\n");
   #endif
 
@@ -227,8 +242,8 @@ void TIM3_IRQ_Handler(void) {
     uint8_t dat[8];
     dat[0] = (pdl0 >> 8) & 0xFFU;
     dat[1] = (pdl0 >> 0) & 0xFFU;
-    dat[2] = (pdl1 >> 8) & 0xFFU;
-    dat[3] = (pdl1 >> 0) & 0xFFU;
+    dat[2] = (pwm >> 8) & 0xFFU;
+    dat[3] = (pwm >> 0) & 0xFFU;
     dat[4] = ((state & 0xFU) << 4) | pkt_idx;
     dat[5] = crc_checksum(dat, CAN_GAS_SIZE - 1, crc_poly);
     CAN->sTxMailBox[0].TDLR = dat[0] | (dat[1] << 8) | (dat[2] << 16) | (dat[3] << 24);
@@ -258,6 +273,27 @@ void TIM3_IRQ_Handler(void) {
     timeout += 1U;
   }
 }
+// PWM output interrupt logic lifted from white Panda started check
+
+void EXTI9_5_IRQ_Handler(void) {
+  //started_interrupt_handler(9);
+  volatile unsigned int pr = EXTI->PR & (1U << 9);
+  if ((pr & (1U << 9)) != 0U) {
+    // // jenky debounce
+    delay(100);
+
+    // check GPIO status
+    bool edge = get_gpio_input(GPIOA, 9);
+    if (edge){
+      ts_prev = TIM2->CNT;
+      EXTI->PR = (1U << 9);
+    }
+    if (!edge){ 
+      pwm = 0xFFF - (TIM2->CNT - ts_prev);
+      EXTI->PR = (1U << 9);
+    }
+  }
+}
 
 // ***************************** main code *****************************
 
@@ -268,11 +304,29 @@ void pedal(void) {
 
   // write the pedal to the DAC
   if (state == NO_FAULT) {
-    dac_set(0, MAX(gas_set_0, pdl0));
-    dac_set(1, MAX(gas_set_1, pdl1));
+    if (gas_set_0 > 0xF){
+      set_gpio_output(GPIOA, 7, 1);
+      // set the coil ON
+      if (pwm <= (gas_set_0 - 10)){
+        // we are below requested accel
+        set_gpio_output(GPIOA, 1, 0);
+        set_gpio_output(GPIOA, 2, 1);
+      }
+      if((gas_set_0 + 10) <= pwm){
+        // we are above requested accel
+        set_gpio_output(GPIOA, 1, 1);
+        set_gpio_output(GPIOA, 2, 0);
+      }
+      if ((gas_set_0 - 10) <= pwm && pwm <= (gas_set_0 + 10)){
+        // we are at requested accel
+        set_gpio_output(GPIOA, 1, 0);
+        set_gpio_output(GPIOA, 2, 0);  
+      }
+    }
   } else {
-    dac_set(0, pdl0);
-    dac_set(1, pdl1);
+    set_gpio_output(GPIOA, 1, 0);
+    set_gpio_output(GPIOA, 2, 0);
+    set_gpio_output(GPIOA, 7, 0);
   }
 
   watchdog_feed();
@@ -297,6 +351,21 @@ int main(void) {
   detect_configuration();
   detect_board_type();
 
+  // Setup angle sensor interrupts
+  REGISTER_INTERRUPT(EXTI9_5_IRQn, EXTI9_5_IRQ_Handler, 0xFFFF, FAULT_INTERRUPT_RATE_TACH)
+  register_set(&(SYSCFG->EXTICR[3]), SYSCFG_EXTICR3_EXTI9_PA, 0x00U);
+  register_set_bits(&(EXTI->IMR), (1U << 9));
+  register_set_bits(&(EXTI->RTSR), (1U << 9));
+  register_set_bits(&(EXTI->FTSR), (1U << 9));
+  NVIC_EnableIRQ(EXTI9_5_IRQn);
+  // init microsecond system timer
+  // increments 1000000 times per second
+  // generate an update to set the prescaler
+  TIM2->PSC = 48-1;
+  TIM2->CR1 = TIM_CR1_CEN;
+  TIM2->EGR = TIM_EGR_UG;
+  // use TIM2->CNT to read
+
   // init board
   current_board->init();
 
@@ -306,7 +375,7 @@ int main(void) {
 #endif
 
   // pedal stuff
-  dac_init();
+  // dac_init();
   adc_init();
 
   // init can
@@ -315,7 +384,8 @@ int main(void) {
     puts("Failed to set llcan speed");
   }
 
-  llcan_init(CAN1);
+  bool ret = llcan_init(CAN1);
+  UNUSED(ret);
 
   // 48mhz / 65536 ~= 732
   timer_init(TIM3, 15);
