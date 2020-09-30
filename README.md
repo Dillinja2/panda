@@ -117,6 +117,8 @@ Hardware
 
 Check out the hardware [guide](https://github.com/commaai/panda/blob/master/docs/guide.pdf)
 
+e hardware [guide](https://github.com/commaai/p
+
 Licensing
 ------
 
